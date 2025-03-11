@@ -407,6 +407,30 @@
 				}
 			},
 			"response": []
+		},
+		{
+			"name": "See book data update history (retrieve cached data)",
+			"request": {
+				"auth": {
+					"type": "noauth"
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:8000/books/history/7",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "8000",
+					"path": [
+						"books",
+						"history",
+						"7"
+					]
+				}
+			},
+			"response": []
 		}
 	]
 }

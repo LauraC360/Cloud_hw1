@@ -1,6 +1,7 @@
 import json
 import http.server
 import urllib
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import mysql.connector
 
@@ -12,6 +13,8 @@ DB_CONFIG = {
 }
 
 TABLE_NAME = "books"
+CACHE = {}
+CACHE_EXPIRATION = timedelta(hours=1)
 
 def init_db():
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -172,54 +175,80 @@ def init_db():
 #         self.wfile.write(json.dumps(response).encode())
 
 class RequestHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, status_code=200):
+    def _set_headers(self, status_code=200, cache_control="no-cache"):
         self.send_response(status_code)
         self.send_header('Content-type', 'application/json')
+        self.send_header('Cache-Control', cache_control)
         self.end_headers()
 
+    def _get_cached_response(self, key):
+        if key in CACHE:
+            cached_data, timestamp = CACHE[key]
+            if datetime.now() - timestamp < CACHE_EXPIRATION:
+                return cached_data
+        return None
+
+    def _set_cached_response(self, key, response):
+        CACHE[key] = (response, datetime.now())
+
     def do_GET(self):
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-
-        route_args = self.path.strip("/").split("/")
-        response = {"error": "Internal server error"}
-        status = 500
-
-        if len(route_args) == 2 and route_args[0] == "books":
-            book_id = route_args[1]
-            cursor.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = %s", (book_id,))
-            row = cursor.fetchone()
-
-            if row:
-                response = {"id": row[0], "title": row[1], "author": row[2], "year": row[3]}
-                status = 200
-            else:
-                response = {"error": "Book not found"}
-                status = 404
-
-        elif len(route_args) == 1 and route_args[0] == "books":
-            cursor.execute(f"SELECT * FROM {TABLE_NAME}")
-            rows = cursor.fetchall()
-
-            response = [{"id": row[0], "title": row[1], "author": row[2], "year": row[3]} for row in rows]
-            status = 200
-
-        elif len(route_args) == 3 and route_args[0] == "books" and route_args[1] == "author":
-            author_name = urllib.parse.unquote(route_args[2])
-            cursor.execute(f"SELECT * FROM {TABLE_NAME} WHERE author = %s", (author_name,))
-            rows = cursor.fetchall()
-
-            response = [{"id": row[0], "title": row[1], "author": row[2], "year": row[3]} for row in rows]
-            status = 200
-
+        if self.path.startswith("/books/history"):
+            self.do_GET_HISTORY()
         else:
-            response = {"error": "Bad request. Bad route"}
-            status = 400
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cursor = conn.cursor()
 
-        cursor.close()
-        conn.close()
-        self._set_headers(status)
-        self.wfile.write(json.dumps(response).encode())
+            route_args = self.path.strip("/").split("/")
+            response = {"error": "Internal server error"}
+            status = 500
+            cache_key = self.path
+
+            cached_response = self._get_cached_response(cache_key)
+            if cached_response:
+                self._set_headers(200, "public, max-age=3600")
+                self.wfile.write(cached_response.encode())
+                return
+
+            if len(route_args) == 2 and route_args[0] == "books":
+                book_id = route_args[1]
+                cursor.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = %s", (book_id,))
+                row = cursor.fetchone()
+
+                if row:
+                    response = {"id": row[0], "title": row[1], "author": row[2], "year": row[3]}
+                    status = 200
+                    cache_control = "public, max-age=3600"  # Cache for 1 hour
+                else:
+                    response = {"error": "Book not found"}
+                    status = 404
+
+            elif len(route_args) == 1 and route_args[0] == "books":
+                cursor.execute(f"SELECT * FROM {TABLE_NAME}")
+                rows = cursor.fetchall()
+
+                response = [{"id": row[0], "title": row[1], "author": row[2], "year": row[3]} for row in rows]
+                status = 200
+                cache_control = "public, max-age=3600"  # Cache for 1 hour
+
+            elif len(route_args) == 3 and route_args[0] == "books" and route_args[1] == "author":
+                author_name = urllib.parse.unquote(route_args[2])
+                cursor.execute(f"SELECT * FROM {TABLE_NAME} WHERE author = %s", (author_name,))
+                rows = cursor.fetchall()
+
+                response = [{"id": row[0], "title": row[1], "author": row[2], "year": row[3]} for row in rows]
+                status = 200
+                cache_control = "public, max-age=3600"  # Cache for 1 hour
+
+            else:
+                response = {"error": "Bad request. Bad route"}
+                status = 400
+
+            cursor.close()
+            conn.close()
+            self._set_headers(status, cache_control)
+            response_json = json.dumps(response)
+            self._set_cached_response(cache_key, response_json)
+            self.wfile.write(response_json.encode())
 
     def do_POST(self):
         conn = mysql.connector.connect(**DB_CONFIG)
@@ -280,22 +309,61 @@ class RequestHandler(BaseHTTPRequestHandler):
         response = {"error": "Internal server error"}
         status = 500
 
-        if len(route_args) == 2 and route_args[0] == "books" and route_args[1] == "batch":
-            if not isinstance(put_data, list):
+        if len(route_args) == 2 and route_args[0] == "books":
+            book_id = route_args[1]
+            if "title" not in put_data or "author" not in put_data or "year" not in put_data:
                 response = {"error": "Bad request. Bad content"}
                 status = 400
             else:
-                for book in put_data:
-                    if "id" not in book or "title" not in book or "author" not in book or "year" not in book:
-                        response = {"error": "Bad request. Bad content"}
-                        status = 400
-                        break
-                else:
-                    for book in put_data:
-                        cursor.execute(f"UPDATE {TABLE_NAME} SET title = %s, author = %s, year = %s WHERE id = %s", (book["title"], book["author"], book["year"], book["id"]))
+                title, author, year = put_data["title"], put_data["author"], put_data["year"]
+                cursor.execute(f"SELECT * FROM {TABLE_NAME} WHERE id = %s", (book_id,))
+                row = cursor.fetchone()
+
+                if row:
+                    # Save current state to history table
+                    cursor.execute(f"INSERT INTO books_history (book_id, title, author, year) VALUES (%s, %s, %s, %s)",
+                                   (row[0], row[1], row[2], row[3]))
                     conn.commit()
-                    response = {"message": "Updated books"}
+
+                    # Update the book
+                    cursor.execute(f"UPDATE {TABLE_NAME} SET title = %s, author = %s, year = %s WHERE id = %s",
+                                   (title, author, year, book_id))
+                    conn.commit()
+                    response = {"message": "Updated book"}
                     status = 200
+                else:
+                    response = {"error": "Book not found"}
+                    status = 404
+
+        else:
+            response = {"error": "Bad request. Bad route"}
+            status = 400
+
+        cursor.close()
+        conn.close()
+        self._set_headers(status)
+        self.wfile.write(json.dumps(response).encode())
+
+    def do_GET_HISTORY(self):
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        route_args = self.path.strip("/").split("/")
+        response = {"error": "Internal server error"}
+        status = 500
+
+        if len(route_args) == 3 and route_args[0] == "books" and route_args[1] == "history":
+            book_id = route_args[2]
+            cursor.execute(f"SELECT * FROM books_history WHERE book_id = %s ORDER BY edited_at DESC", (book_id,))
+            rows = cursor.fetchall()
+
+            if rows:
+                response = [{"id": row[0], "book_id": row[1], "title": row[2], "author": row[3], "year": row[4],
+                             "edited_at": row[5].strftime("%Y-%m-%d %H:%M:%S")} for row in rows]
+                status = 200
+            else:
+                response = {"error": "No history found for the book"}
+                status = 404
 
         else:
             response = {"error": "Bad request. Bad route"}
